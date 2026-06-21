@@ -212,7 +212,7 @@ class TournamentBot(commands.Bot):
 
     async def on_ready(self) -> None:
         logger.info("Bot ready: %s (ID: %s)", self.user, self.user.id)
-        await self.change_presence(discord.Activity(
+        await self.change_presence(activity=discord.Activity(
             type=discord.ActivityType.watching,
             name="tournaments | /setup tournament",
         ))
