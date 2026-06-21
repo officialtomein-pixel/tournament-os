@@ -1,8 +1,10 @@
 """
-Async SQLAlchemy session factory — shared by both bot_main.py and web_main.py.
-Each process creates its own engine and session factory using the same DATABASE_URL.
-SSL is enabled via connect_args when the original URL contained sslmode=require,
-because asyncpg does not accept sslmode as a URL query parameter.
+Async SQLAlchemy session factory.
+
+SSL is always enabled with CERT_NONE so Railway/Render/Neon PostgreSQL
+connections work regardless of whether the URL includes sslmode=require.
+asyncpg does not accept sslmode as a URL query param — we strip it and
+pass ssl via connect_args instead.
 """
 import os
 import ssl
@@ -12,10 +14,16 @@ from sqlalchemy.pool import NullPool
 
 from app.config import settings
 
-# Detect whether the raw DATABASE_URL asked for SSL so we can pass it the
-# asyncpg-correct way (connect_args) rather than as a URL query param.
 _raw_url = os.getenv("DATABASE_URL", "")
-_wants_ssl = "sslmode=require" in _raw_url or "sslmode=verify" in _raw_url
+
+# Enable SSL when the URL requests it OR when running in production.
+# Railway's PostgreSQL plugin always works with SSL; enabling it unconditionally
+# in production avoids connection failures on cloud providers.
+_wants_ssl = (
+    "sslmode=require" in _raw_url
+    or "sslmode=verify" in _raw_url
+    or os.getenv("ENVIRONMENT", "development") == "production"
+)
 
 _connect_args: dict = {}
 if _wants_ssl:
@@ -39,18 +47,6 @@ AsyncSessionLocal = async_sessionmaker(
     autoflush=False,
     autocommit=False,
 )
-
-
-async def get_session() -> AsyncSession:
-    """FastAPI dependency — yields a session and closes it after the request."""
-    async with AsyncSessionLocal() as session:
-        try:
-            yield session
-        except Exception:
-            await session.rollback()
-            raise
-        finally:
-            await session.close()
 
 
 async def get_db_session() -> AsyncSession:

@@ -1,11 +1,30 @@
 """
-Discord Bot entrypoint — runs as a separate process from the web server.
-Connects to the same PostgreSQL DB and listens for cross-process events via NOTIFY.
+Discord Bot entrypoint.
+Connects to PostgreSQL DB and listens for cross-process events via NOTIFY.
+
+IPv4 patch applied at module level — Railway containers do not support IPv6.
+discord.py (aiohttp) and asyncpg both try IPv6 first; forcing IPv4 avoids
+"OSError: [Errno 101] Network is unreachable" on Railway / most cloud runners.
 """
 import asyncio
 import logging
+import socket
 import sys
 
+# ── IPv4-only patch ───────────────────────────────────────────────────────────
+# Must be applied BEFORE any network library is imported so that aiohttp,
+# asyncpg, and httpx all resolve hostnames to IPv4 addresses only.
+_orig_getaddrinfo = socket.getaddrinfo
+
+def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    results = _orig_getaddrinfo(host, port, family, type, proto, flags)
+    ipv4 = [r for r in results if r[0] == socket.AF_INET]
+    return ipv4 if ipv4 else results  # fall back to all results if no IPv4
+
+socket.getaddrinfo = _ipv4_getaddrinfo
+# ─────────────────────────────────────────────────────────────────────────────
+
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -25,10 +44,13 @@ class TournamentBot(commands.Bot):
         intents = discord.Intents.default()
         intents.message_content = True
         intents.members = True
+        # Force IPv4 at the aiohttp level as well (belt-and-suspenders)
+        connector = aiohttp.TCPConnector(family=socket.AF_INET)
         super().__init__(
             command_prefix="!",
             intents=intents,
             description="Tournament Operating System Bot",
+            connector=connector,
         )
         self._pg_listener = None
 
@@ -63,8 +85,7 @@ class TournamentBot(commands.Bot):
         except Exception as e:
             logger.error("Failed to sync commands globally: %s", e)
 
-        # Wire up the app_commands tree error handler (discord.py 2.x requires this
-        # — on_application_command_error is NOT fired for app_commands errors)
+        # Wire up the app_commands tree error handler
         @self.tree.error
         async def on_tree_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
             logger.error(
@@ -89,7 +110,7 @@ class TournamentBot(commands.Bot):
         from app.services.scheduler import run_scheduler
         asyncio.create_task(run_scheduler())
 
-        # Start the autonomous tournament engine (2.0 — self-managing tournaments)
+        # Start the autonomous tournament engine
         from app.services.autonomous_engine import run_autonomous_engine
         asyncio.create_task(run_autonomous_engine())
 
@@ -97,16 +118,6 @@ class TournamentBot(commands.Bot):
         """
         Re-register all persistent views (timeout=None) so Discord button
         interactions keep working after a bot restart.
-
-        Restores:
-        - PlayerHubView         (static custom_ids — one instance)
-        - SupportTicketView     (static custom_ids — one instance)
-        - CheckInView           (checkin_open tournaments)
-        - TournamentCreateView  (guilds with create_tournament_channel_id)
-        - TournamentManageView  (tournaments with manage_channel_id)
-        - ControlPanelView      (active tournaments with manage_channel_id)
-        - RegistrationButtonView(registration_open tournaments with reg channel)
-        - RegistrationCardView  (pending/flagged/hold registrations)
         """
         try:
             from app.database.session import AsyncSessionLocal
@@ -123,7 +134,6 @@ class TournamentBot(commands.Bot):
             from app.bot.views.control_panel_view import ControlPanelView
             from sqlalchemy import select
 
-            # ── Static views (one instance handles all guilds) ───────────────
             self.add_view(PlayerHubView())
             logger.info("Restored PlayerHubView (static)")
 
@@ -131,7 +141,6 @@ class TournamentBot(commands.Bot):
             logger.info("Restored SupportTicketView (static)")
 
             async with AsyncSessionLocal() as session:
-                # ── CheckInView ─────────────────────────────────────────────
                 checkin_q = (
                     select(Tournament)
                     .where(Tournament.status == TournamentStatus.CHECKIN_OPEN)
@@ -146,7 +155,6 @@ class TournamentBot(commands.Bot):
                 if not checkin_tournaments:
                     logger.info("No active check-in tournaments — no CheckInViews to restore")
 
-                # ── TournamentCreateView ────────────────────────────────────
                 guilds_q = select(Guild).where(Guild.deleted_at.is_(None))
                 guilds_result = await session.execute(guilds_q)
                 guilds = guilds_result.scalars().all()
@@ -164,18 +172,11 @@ class TournamentBot(commands.Bot):
 
                 logger.info("Restored %d TournamentCreateView(s)", create_count)
 
-                # ── TournamentManageView + ControlPanelView + RegistrationButtonView ──
-                all_t_q = (
-                    select(Tournament)
-                    .where(Tournament.deleted_at.is_(None))
-                )
+                all_t_q = select(Tournament).where(Tournament.deleted_at.is_(None))
                 all_t_result = await session.execute(all_t_q)
                 all_tournaments = all_t_result.scalars().all()
 
-                manage_count = 0
-                cp_count = 0
-                reg_count = 0
-
+                manage_count = cp_count = reg_count = 0
                 _ended = {TournamentStatus.COMPLETED, TournamentStatus.ARCHIVED, TournamentStatus.CANCELLED}
 
                 for t in all_tournaments:
@@ -185,8 +186,6 @@ class TournamentBot(commands.Bot):
                     if t_settings.get("manage_channel_id"):
                         self.add_view(TournamentManageView(tournament_id=t.id, org_id=org_id))
                         manage_count += 1
-
-                        # Restore ControlPanelView for non-ended tournaments
                         if t.status not in _ended:
                             self.add_view(ControlPanelView(tournament_id=t.id, org_id=org_id))
                             cp_count += 1
@@ -202,7 +201,6 @@ class TournamentBot(commands.Bot):
                 logger.info("Restored %d ControlPanelView(s)", cp_count)
                 logger.info("Restored %d RegistrationButtonView(s)", reg_count)
 
-                # ── RegistrationCardView (pending/flagged/hold) ─────────────
                 actionable_statuses = [
                     RegistrationStatus.PENDING,
                     RegistrationStatus.FLAGGED,
@@ -250,13 +248,14 @@ class TournamentBot(commands.Bot):
         )
         await self.change_presence(activity=activity)
 
-        # Guild-sync so commands are available instantly (global sync can take ~1h).
-        # copy_global_to mirrors the global command tree into the guild scope first.
         for guild in self.guilds:
             try:
                 self.tree.copy_global_to(guild=guild)
                 guild_synced = await self.tree.sync(guild=guild)
-                logger.info("Guild-synced %d commands to '%s' (%s)", len(guild_synced), guild.name, guild.id)
+                logger.info(
+                    "Guild-synced %d commands to '%s' (%s)",
+                    len(guild_synced), guild.name, guild.id,
+                )
             except Exception as e:
                 logger.warning("Could not guild-sync to '%s': %s", guild.name, e)
 
@@ -265,7 +264,10 @@ class TournamentBot(commands.Bot):
         try:
             self.tree.copy_global_to(guild=guild)
             guild_synced = await self.tree.sync(guild=guild)
-            logger.info("Guild-synced %d commands to new guild '%s'", len(guild_synced), guild.name)
+            logger.info(
+                "Guild-synced %d commands to new guild '%s'",
+                len(guild_synced), guild.name,
+            )
         except Exception as e:
             logger.warning("Could not guild-sync to new guild '%s': %s", guild.name, e)
 
@@ -274,20 +276,6 @@ class TournamentBot(commands.Bot):
         if self._pg_listener:
             await self._pg_listener.stop()
         await super().close()
-
-
-async def run_migrations() -> None:
-    """Run Alembic migrations on startup (async-safe via subprocess)."""
-    proc = await asyncio.create_subprocess_exec(
-        "alembic", "upgrade", "head",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        logger.warning("Alembic migration warning:\n%s", stderr.decode().strip())
-    else:
-        logger.info("Migrations applied:\n%s", stdout.decode().strip())
 
 
 async def main() -> None:
@@ -300,9 +288,18 @@ async def main() -> None:
         sys.exit(1)
 
     logger.info("Running database migrations...")
-    await run_migrations()
+    proc = await asyncio.create_subprocess_exec(
+        "alembic", "upgrade", "head",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        logger.warning("Alembic migration output:\n%s", stderr.decode().strip())
+    else:
+        logger.info("Migrations OK:\n%s", stdout.decode().strip())
 
-    # Retry loop — handles Discord rate limits (429) and transient network errors.
+    # Retry loop — handles Discord rate limits and transient network errors
     delay = 10
     max_delay = 300
     attempt = 0
@@ -318,7 +315,7 @@ async def main() -> None:
             if exc.status == 429:
                 retry_after = getattr(exc, "retry_after", None) or delay
                 logger.warning(
-                    "Discord rate-limited (attempt %d). Retrying in %.1f seconds…",
+                    "Discord rate-limited (attempt %d). Retrying in %.1fs…",
                     attempt, retry_after,
                 )
                 await asyncio.sleep(retry_after)
@@ -328,7 +325,7 @@ async def main() -> None:
                 raise
         except (OSError, ConnectionError) as exc:
             logger.warning(
-                "Network error (attempt %d): %s. Retrying in %d seconds…",
+                "Network error (attempt %d): %s. Retrying in %ds…",
                 attempt, exc, delay,
             )
             await asyncio.sleep(delay)
