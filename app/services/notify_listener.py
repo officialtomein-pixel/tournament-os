@@ -1,7 +1,5 @@
 """
 PostgreSQL LISTEN/NOTIFY listener — cross-process event sync.
-Each process (bot, web) runs this independently to receive events
-emitted by the other process via pg_notify().
 
 Usage:
     listener = PGNotifyListener(database_url, handler_fn)
@@ -10,6 +8,8 @@ Usage:
 import asyncio
 import json
 import logging
+import os
+import ssl
 from typing import Callable, Awaitable
 
 import asyncpg
@@ -19,11 +19,23 @@ logger = logging.getLogger(__name__)
 CHANNEL = "tournament_os_events"
 Handler = Callable[[dict], Awaitable[None]]
 
+# Build an SSL context for production (Railway always requires SSL).
+_ssl_ctx: ssl.SSLContext | None = None
+if os.getenv("ENVIRONMENT", "development") == "production":
+    _ssl_ctx = ssl.create_default_context()
+    _ssl_ctx.check_hostname = False
+    _ssl_ctx.verify_mode = ssl.CERT_NONE
+
 
 class PGNotifyListener:
     def __init__(self, database_url: str, handler: Handler):
         # asyncpg uses plain postgresql:// not sqlalchemy's postgresql+asyncpg://
-        self._dsn = database_url.replace("postgresql+asyncpg://", "postgresql://")
+        # Also strip sslmode= param — asyncpg doesn't understand it; we pass ssl= directly.
+        dsn = database_url.replace("postgresql+asyncpg://", "postgresql://")
+        if "sslmode=" in dsn:
+            import re
+            dsn = re.sub(r"[?&]sslmode=[^&]*", "", dsn).rstrip("?&")
+        self._dsn = dsn
         self._handler = handler
         self._conn: asyncpg.Connection | None = None
         self._running = False
@@ -43,13 +55,15 @@ class PGNotifyListener:
             await self._conn.close()
 
     async def _connect_and_listen(self) -> None:
-        self._conn = await asyncpg.connect(dsn=self._dsn)
+        connect_kwargs: dict = {"dsn": self._dsn}
+        if _ssl_ctx is not None:
+            connect_kwargs["ssl"] = _ssl_ctx
+
+        self._conn = await asyncpg.connect(**connect_kwargs)
         await self._conn.add_listener(CHANNEL, self._on_notify)
         logger.info("PGNotifyListener: listening on channel '%s'", CHANNEL)
-        # Keep alive — poll every 30s as a safety net
         while self._running:
             await asyncio.sleep(30)
-            # Lightweight heartbeat query
             try:
                 await self._conn.fetchval("SELECT 1")
             except Exception:
