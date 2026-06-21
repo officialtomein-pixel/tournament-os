@@ -1,8 +1,7 @@
 # 🏆 Tournament OS 2.0
 
-A production-grade **Tournament Operating System** — Discord bot + web dashboard for running esports tournaments. Multi-org, AI-assisted, and Railway-ready.
-
-[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/template/tournament-os)
+A production-grade **Discord Tournament Bot** for running esports tournaments.
+Multi-org, AI-assisted, and Railway-ready.
 
 ---
 
@@ -10,88 +9,60 @@ A production-grade **Tournament Operating System** — Discord bot + web dashboa
 
 | Surface | What it does |
 |---------|-------------|
-| `/setup tournament` | 7-step wizard — creates roles, categories, and 20 channels automatically |
-| `#register` (Player Hub) | Persistent button — players click to register; no commands needed |
+| `/setup tournament` | 7-step wizard — creates roles, categories & 20 channels automatically |
+| `#register` | Persistent button — players click to register; no commands needed |
 | `#verification-queue` | Auto-posted Approve / Reject / Hold / Flag / Send Back cards |
 | `#create-tournament` | Persistent button — 6-step tournament creation wizard |
-| **Control Panel** | 9 action buttons per tournament: Status, Registration, Players, Matches, Brackets, Check-in, Announcements, Rules, Danger |
+| **Control Panel** | 9 action buttons per tournament (Status, Bracket, Check-in, Matches, etc.) |
 | **Support Tickets** | `#support` button → private thread per user |
-| `/ask` | AI assistant (Groq `llama-3.3-70b-versatile`) scoped per org/guild/tournament |
-| **Web Dashboard** | Tournament management, registration review, match oversight, standings, disputes, analytics |
+| `/ask` | AI assistant (Groq `llama-3.3-70b-versatile`) scoped per guild/tournament |
 
 ---
 
-## 🚀 Deploy to Railway (Recommended)
+## 🚀 Deploy to Railway
 
-Tournament OS runs as **two Railway services** from the same repo — the bot and the web server.
+### Step 1 — Create project
+1. [railway.app](https://railway.app) → **New Project** → **Deploy from GitHub repo** → select `tournament-os`
+2. Add a **PostgreSQL** database plugin
 
-### Step 1 — Create a Railway project
+### Step 2 — Set environment variables
 
-1. Go to [railway.app](https://railway.app) → **New Project**
-2. Choose **Deploy from GitHub repo** → select `tournament-os`
-3. Add a **PostgreSQL** plugin from the Railway dashboard
+In the service **Variables** tab:
 
-### Step 2 — Web service
-
-- **Root Directory:** `/` (repo root)
-- **Config file:** `railway.web.toml`
-- Railway auto-runs `alembic upgrade head && python web_main.py` on deploy
-
-### Step 3 — Bot service
-
-- In the same project, click **+ New Service → GitHub Repo** (same repo)
-- **Config file:** `railway.bot.toml`
-- Railway runs `python bot_main.py`
-
-### Step 4 — Environment Variables
-
-Set these on **both** services (Railway dashboard → Variables):
-
-| Variable | Description |
-|----------|-------------|
-| `DISCORD_TOKEN` | Your Discord bot token |
-| `DISCORD_CLIENT_ID` | Your Discord application client ID |
-| `DATABASE_URL` | Auto-filled by Railway PostgreSQL plugin |
-| `GROQ_API_KEY` | Groq API key — [console.groq.com](https://console.groq.com) (free) |
-| `ADMIN_DASHBOARD_TOKEN` | Random secret for dashboard auth — `openssl rand -hex 32` |
-| `SECRET_KEY` | Random secret for sessions — `openssl rand -hex 32` |
+| Variable | Value |
+|----------|-------|
+| `DATABASE_URL` | click **Add Reference** → PostgreSQL plugin (auto-filled) |
+| `DISCORD_TOKEN` | your Discord bot token |
+| `DISCORD_CLIENT_ID` | your Discord application client ID |
+| `GROQ_API_KEY` | from [console.groq.com](https://console.groq.com) (free) |
 | `ENVIRONMENT` | `production` |
 
-> `PORT` is injected automatically by Railway — do NOT set it manually.
+### Step 3 — Deploy
+Railway uses `railway.toml` automatically. It will:
+- Build with `Dockerfile.bot`
+- Run `alembic upgrade head` (migrations) then `python bot_main.py`
+
+> No healthcheck — the bot is a background process, not a web server.
 
 ---
 
 ## 🖥️ Local Development
 
 ```bash
-# 1. Clone
 git clone https://github.com/officialtomein-pixel/tournament-os.git
 cd tournament-os
 
-# 2. Install dependencies
 pip install -r requirements.txt
+cp .env.example .env   # fill in your values
 
-# 3. Copy and fill in env vars
-cp .env.example .env
-
-# 4. Run DB migrations
 alembic upgrade head
-
-# 5. Start the bot (terminal 1)
 python bot_main.py
-
-# 6. Start the web server (terminal 2)
-python web_main.py
 ```
 
-Or use Docker Compose:
-
+Or with Docker Compose (includes PostgreSQL):
 ```bash
 docker compose up -d
 ```
-
-Dashboard: `http://localhost:8000/dashboard`  
-API docs: `http://localhost:8000/api/docs`
 
 ---
 
@@ -101,7 +72,7 @@ API docs: `http://localhost:8000/api/docs`
 Run `/setup tournament` → 7-step wizard creates all roles and channels automatically.
 
 ### Phase 2 — Create a Tournament
-Click the **Create Tournament** button in `#create-tournament` → 6-step wizard.
+Click **Create Tournament** in `#create-tournament` → 6-step wizard.
 
 ### Phase 3 — Manage via Control Panel
 Every tournament gets a **Control Panel** with 9 buttons — no commands needed.
@@ -111,7 +82,7 @@ Cards appear in `#verification-queue` with Approve / Reject / Hold / Flag / Send
 
 ### Phase 5 — Run Matches
 ```
-/tournament_generate_bracket [tournament_id]   ← generates bracket
+/tournament_generate_bracket [tournament_id]   ← generate bracket (staff)
 /submit_score [match_id]                       ← players submit scores
 /score_override [match_id]                     ← staff override (Referee+)
 ```
@@ -120,7 +91,6 @@ Cards appear in `#verification-queue` with Approve / Reject / Hold / Flag / Send
 
 ## 📋 All Slash Commands
 
-### Admin / Staff
 | Command | Permission | Description |
 |---------|-----------|-------------|
 | `/setup tournament` | Owner | One-time server setup wizard |
@@ -128,16 +98,12 @@ Cards appear in `#verification-queue` with Approve / Reject / Hold / Flag / Send
 | `/analytics` | Admin | View tournament stats |
 | `/score_override` | Referee+ | Override a match score |
 | `/dispute_list` | Moderator+ | List open disputes |
-| `/dispute_assign` | Moderator+ | Assign a dispute to staff |
+| `/dispute_assign` | Moderator+ | Assign dispute to staff |
 | `/dispute_resolve` | Moderator+ | Close a dispute |
-
-### Players
-| Command | Description |
-|---------|-------------|
-| `/my_registration` | Check your registration status |
-| `/submit_score` | Submit match result |
-| `/standings` | View standings/leaderboard |
-| `/ask` | Ask the AI assistant |
+| `/my_registration` | Anyone | Check your registration status |
+| `/submit_score` | Players | Submit match result |
+| `/standings` | Anyone | View standings |
+| `/ask` | Anyone | AI assistant |
 
 ---
 
@@ -147,11 +113,10 @@ Cards appear in `#verification-queue` with Approve / Reject / Hold / Flag / Send
 |-------|-----------|
 | Language | Python 3.11 |
 | Discord | discord.py 2.x |
-| Web | FastAPI + Uvicorn |
 | Database | PostgreSQL 16 + SQLAlchemy 2.0 async (asyncpg) |
-| Migrations | Alembic |
+| Migrations | Alembic (auto-runs on deploy) |
 | AI | Groq API — `llama-3.3-70b-versatile` |
-| Deployment | Railway (2 services) / Docker Compose |
+| Deployment | Railway / Docker |
 
 ---
 
@@ -160,14 +125,11 @@ Cards appear in `#verification-queue` with Approve / Reject / Hold / Flag / Send
 ```
 tournament-os/
 ├── bot_main.py                   Discord bot entrypoint
-├── web_main.py                   FastAPI web server entrypoint
 ├── requirements.txt
 ├── alembic.ini
-├── Dockerfile.bot                Railway/Docker — bot service
-├── Dockerfile.web                Railway/Docker — web service
-├── railway.bot.toml              Railway bot service config
-├── railway.web.toml              Railway web service config
-├── docker-compose.yml            Local dev
+├── Dockerfile.bot
+├── railway.toml                  Railway deploy config
+├── docker-compose.yml            Local dev (bot + PostgreSQL)
 └── app/
     ├── bot/
     │   ├── cogs/                 Slash commands (admin, match, registration, dispute, AI)
@@ -178,15 +140,9 @@ tournament-os/
     │   ├── models/               17 SQLAlchemy ORM models
     │   ├── repositories/         Typed repos with org isolation
     │   └── migrations/           Alembic DDL migrations
-    ├── web/routes/               FastAPI routes (dashboard, public, health, AI chat)
-    └── config/settings.py        All env-var config (pydantic-settings)
+    ├── ai/                       Groq AI assistant
+    └── config/settings.py        Env-var config (pydantic-settings)
 ```
-
----
-
-## 🔐 Environment Variables Reference
-
-See [`.env.example`](.env.example) for a full list with descriptions.
 
 ---
 

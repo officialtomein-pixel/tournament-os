@@ -17,27 +17,6 @@ services:
       timeout: 5s
       retries: 10
 
-  web:
-    build:
-      context: .
-      dockerfile: Dockerfile.web
-    environment:
-      DATABASE_URL: postgresql+asyncpg://tournament:tournament_pass@postgres:5432/tournament_os
-      ADMIN_DASHBOARD_TOKEN: ${ADMIN_DASHBOARD_TOKEN:-dev_admin_token_change_me}
-      SECRET_KEY: ${SECRET_KEY:-dev_secret_key_change_me}
-      GROQ_API_KEY: ${GROQ_API_KEY}
-      ENVIRONMENT: ${ENVIRONMENT:-development}
-      WEB_HOST: 0.0.0.0
-      WEB_PORT: 8000
-    ports:
-      - "8000:8000"
-    depends_on:
-      postgres:
-        condition: service_healthy
-    restart: unless-stopped
-    volumes:
-      - ./app:/app/app
-
   bot:
     build:
       context: .
