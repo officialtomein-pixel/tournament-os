@@ -116,3 +116,7 @@ def error_embed(message: str) -> discord.Embed:
 
 def success_embed(message: str, title: str = "Success") -> discord.Embed:
     return discord.Embed(title=title, description=message, color=discord.Color.green())
+
+
+def info_embed(message: str, title: str = "Info") -> discord.Embed:
+    return discord.Embed(title=title, description=message, color=discord.Color.blurple())

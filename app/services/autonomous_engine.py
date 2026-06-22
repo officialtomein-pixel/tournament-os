@@ -292,15 +292,16 @@ async def _create_match_channels(
         # Announce new round to schedule channel
         if match_ids and schedule_channel_id:
             from app.services.notification.discord_delivery import notify_round_started
-            first_match_data = None
+            from app.database.models.match import Match as MatchModel
+            first_round_num: int | None = None
             async with AsyncSessionLocal() as s2:
-                first = await s2.get(type(match), match_ids[0])
-                if first:
-                    first_match_data = first.round
-            if first_match_data:
+                first_match = await s2.get(MatchModel, match_ids[0])
+                if first_match:
+                    first_round_num = first_match.round
+            if first_round_num is not None:
                 await notify_round_started(
                     tournament_name=tournament.name,
-                    round_num=first_match_data,
+                    round_num=first_round_num,
                     match_count=len(match_ids),
                     schedule_channel_id=schedule_channel_id,
                 )
