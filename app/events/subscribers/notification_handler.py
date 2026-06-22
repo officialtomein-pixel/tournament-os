@@ -59,21 +59,26 @@ async def _get_tournament_info(tournament_id: str, organization_id: str) -> dict
 
 
 async def _get_user_discord_id(registration_id: str) -> tuple[str | None, str | None]:
-    """Return (discord_id, team_name) for a registration."""
+    """Return (discord_user_id, team_name) for a registration.
+
+    Registration.submitted_by → User.discord_user_id
+    """
     try:
         from app.database.session import AsyncSessionLocal
         from app.database.models.registration import Registration
         from app.database.models.team import Team
-        from sqlalchemy import select
+        from app.database.models.user import User
 
         async with AsyncSessionLocal() as session:
             reg = await session.get(Registration, registration_id)
             if not reg:
                 return None, None
 
-            discord_id = reg.discord_user_id
-            team_name: str | None = None
+            # Look up the Discord ID via the User FK
+            user = await session.get(User, reg.submitted_by)
+            discord_id = user.discord_user_id if user else None
 
+            team_name: str | None = None
             if reg.team_id:
                 team = await session.get(Team, reg.team_id)
                 if team:

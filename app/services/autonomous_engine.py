@@ -268,7 +268,7 @@ async def _create_match_channels(
                     if not team.captain_id:
                         return None
                     user = await session.get(User, team.captain_id)
-                    return user.discord_id if user else None
+                    return user.discord_user_id if user else None
 
                 cap1_id = await _get_captain_discord_id(team1)
                 cap2_id = await _get_captain_discord_id(team2)

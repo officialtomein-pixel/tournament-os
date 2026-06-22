@@ -223,24 +223,20 @@ class ScoreHandler:
                 },
             )
 
-            # Publish dispute event so staff gets notified
+            # Publish dispute event so notification handler alerts staff.
+            # (Full Dispute row requires a real user FK, so we fire the event
+            # directly instead of calling DisputeCaseManager.open_dispute.)
             try:
-                from app.services.dispute.case_manager import DisputeCaseManager
-                dispute_mgr = DisputeCaseManager(self.session)
-                await dispute_mgr.open_case(
-                    organization_id=organization_id,
-                    tournament_id=tournament_id,
+                await match_pub.dispute_opened(
+                    dispute_id=f"auto-{full_match_id[:8]}",
                     match_id=full_match_id,
-                    case_type="score_dispute",
+                    tournament_id=tournament_id,
+                    organization_id=organization_id,
                     opened_by="system",
-                    description=(
-                        f"Auto-dispute: Teams submitted conflicting scores.\n"
-                        f"Team1 claims winner: {team1_claim['winner_id']}\n"
-                        f"Team2 claims winner: {team2_claim['winner_id']}"
-                    ),
+                    case_type="wrong_score",
                 )
             except Exception as exc:
-                logger.error("Failed to open auto-dispute for match %s: %s", full_match_id[:8], exc)
+                logger.warning("Failed to publish auto-dispute event for match %s: %s", full_match_id[:8], exc)
 
             return "disputed"
 
