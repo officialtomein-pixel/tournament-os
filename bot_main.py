@@ -73,6 +73,7 @@ class TournamentBot(commands.Bot):
             "app.bot.cogs.dispute_cog",
             "app.bot.cogs.override_cog",
             "app.bot.cogs.search_cog",
+            "app.bot.cogs.flags_cog",
         ]
         for cog in cog_modules:
             try:
@@ -83,6 +84,10 @@ class TournamentBot(commands.Bot):
 
         import app.events.subscribers.notification_handler  # noqa: F401
         import app.events.subscribers.analytics_handler  # noqa: F401
+
+        # Wire webhook delivery into the event bus
+        from app.services.webhook.webhook_service import register_webhook_subscriber
+        register_webhook_subscriber()
 
         await self._restore_persistent_views()
 
