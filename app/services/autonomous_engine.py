@@ -84,6 +84,16 @@ async def _process_tournament(tournament_id: str, organization_id: str) -> None:
             await _handle_swiss_auto(session, t, bracket, all_matches, pending)
             return
 
+        # Group Stage + Playoffs: transition from groups to playoff bracket
+        if t.format.value == "group_stage_playoffs":
+            await _handle_group_stage_playoffs_auto(session, t, bracket, all_matches, pending, organization_id)
+            return
+
+        # League (season/points): check if all matchdays are done → complete
+        if t.format.value in ("season_league", "points_league"):
+            await _handle_league_auto(session, t, bracket, all_matches, pending, organization_id)
+            return
+
         # Elimination: advance winners and generate next round
         if t.format.value in ("single_elimination", "double_elimination", "triple_elimination"):
             if not pending:
@@ -168,6 +178,105 @@ async def _handle_swiss_auto(session, tournament, bracket, all_matches, pending)
                     )
             except Exception as exc:
                 logger.warning("Swiss round generation failed: %s", exc)
+
+
+async def _handle_group_stage_playoffs_auto(
+    session, tournament, bracket, all_matches, pending, organization_id: str
+) -> None:
+    """
+    Group Stage + Playoffs automation:
+    - Phase 1 (group_stage): wait for all group matches to complete, then
+      determine top N teams per group and generate a SE playoff bracket.
+    - Phase 2 (playoffs): run like single_elimination until winner found.
+    """
+    from app.database.models.match import MatchStatus
+    from app.database.models.standings import Standings
+    from app.database.session import AsyncSessionLocal
+    from sqlalchemy import select
+
+    bd = bracket.bracket_data or {}
+    phase = bd.get("phase", "group_stage")
+
+    if phase == "group_stage":
+        if pending:
+            return  # Group matches still running
+
+        # All group matches done — determine advancers
+        advance_per_group = bd.get("advance_per_group", 2)
+        groups: dict = bd.get("groups", {})
+
+        async with AsyncSessionLocal() as s:
+            async with s.begin():
+                standings_q = (
+                    select(Standings)
+                    .where(
+                        Standings.organization_id == organization_id,
+                        Standings.tournament_id == tournament.id,
+                    )
+                    .order_by(Standings.wins.desc(), Standings.points.desc())
+                )
+                all_standings = list((await s.execute(standings_q)).scalars().all())
+                standings_map = {st.team_id: st for st in all_standings}
+
+                playoff_team_ids: list[str] = []
+                for group_label, team_ids in groups.items():
+                    group_standings = sorted(
+                        [standings_map[tid] for tid in team_ids if tid in standings_map],
+                        key=lambda x: (-x.wins, -x.points),
+                    )
+                    playoff_team_ids.extend(
+                        [gs.team_id for gs in group_standings[:advance_per_group]]
+                    )
+
+                logger.info(
+                    "GSP auto: %d teams advance to playoffs for tournament %s",
+                    len(playoff_team_ids), tournament.id[:8],
+                )
+
+                # Generate playoff bracket (stage 2 = SE)
+                from app.services.bracket.generator import BracketGenerator
+                from app.database.models.tournament import TournamentFormat
+                from app.database.repositories.team import TeamRepository
+                from app.database.models.team import Team
+
+                team_q = select(Team).where(Team.id.in_(playoff_team_ids))
+                playoff_teams = list((await s.execute(team_q)).scalars().all())
+
+                playoff_bracket = await BracketGenerator(s).generate(
+                    organization_id=organization_id,
+                    tournament_id=tournament.id,
+                    format=TournamentFormat.SINGLE_ELIMINATION,
+                    stage=2,
+                )
+                # Update original bracket phase
+                bracket_obj = await s.get(type(bracket), bracket.id)
+                if bracket_obj:
+                    new_bd = dict(bracket_obj.bracket_data or {})
+                    new_bd["phase"] = "playoffs"
+                    bracket_obj.bracket_data = new_bd
+
+        logger.info("GSP auto: playoff bracket generated for tournament %s", tournament.id[:8])
+
+    elif phase == "playoffs":
+        # Behave like single elimination
+        if not pending:
+            await _auto_complete_tournament(session, tournament, organization_id)
+
+
+async def _handle_league_auto(
+    session, tournament, bracket, all_matches, pending, organization_id: str
+) -> None:
+    """
+    League automation (season_league / points_league):
+    All matchdays are scheduled upfront. When all are complete, the
+    tournament is auto-completed — champion determined by standings.
+    """
+    if not pending:
+        logger.info(
+            "Autonomous League: all matchdays complete for tournament %s — completing",
+            tournament.id[:8],
+        )
+        await _auto_complete_tournament(session, tournament, organization_id)
 
 
 async def _create_match_channels(
@@ -338,7 +447,7 @@ async def _auto_complete_tournament(session, tournament, organization_id: str) -
                 try:
                     from app.services.snapshot.snapshot_service import SnapshotService
                     snap_svc = SnapshotService(session)
-                    await snap_svc.take_snapshot(
+                    await snap_svc.take(
                         tournament_id=tournament.id,
                         organization_id=organization_id,
                         trigger="tournament_completed",

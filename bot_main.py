@@ -125,6 +125,9 @@ class TournamentBot(commands.Bot):
         from app.services.autonomous_engine import run_autonomous_engine
         asyncio.create_task(run_autonomous_engine())
 
+        from app.services.job_queue.worker import run_job_queue_worker
+        asyncio.create_task(run_job_queue_worker())
+
     async def _restore_persistent_views(self) -> None:
         try:
             from app.database.session import AsyncSessionLocal

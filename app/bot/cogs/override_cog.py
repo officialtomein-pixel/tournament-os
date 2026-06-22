@@ -349,7 +349,7 @@ async def override_snapshot(
 
             try:
                 svc = SnapshotService(session)
-                snap = await svc.take_snapshot(
+                snap = await svc.take(
                     tournament_id=tournament.id,
                     organization_id=guild.organization_id,
                     trigger="manual",
@@ -369,6 +369,134 @@ async def override_snapshot(
         ephemeral=True,
     )
     logger.info("override.snapshot: tournament=%s snap=%s by=%s", tournament_id[:8], snap.id[:8], interaction.user.id)
+
+
+# ── /override restore ─────────────────────────────────────────────────────────
+
+@override_group.command(name="restore", description="Restore a tournament to a previous snapshot state")
+@app_commands.describe(
+    snapshot_id="Snapshot ID (first 8 chars or full ID)",
+    confirm="Type CONFIRM to proceed — this overwrites current tournament status",
+)
+async def override_restore(
+    interaction: discord.Interaction,
+    snapshot_id: str,
+    confirm: str = "",
+) -> None:
+    await interaction.response.defer(ephemeral=True)
+    from app.database.session import AsyncSessionLocal
+    from app.database.repositories.tournament import TournamentRepository
+    from app.services.snapshot.snapshot_service import SnapshotService
+    from app.database.models.tournament import Tournament, TournamentStatus
+    from app.database.models.standings import Standings
+    from app.database.models.audit_log import AuditLog
+    from app.bot.helpers.formatters import success_embed, error_embed, info_embed
+    from sqlalchemy import select
+
+    if confirm.upper() != "CONFIRM":
+        await interaction.followup.send(
+            embed=info_embed(
+                "⚠️ **This will overwrite the current tournament status and standings with the snapshot data.**\n\n"
+                f"Re-run the command with `confirm: CONFIRM` to proceed.\n"
+                f"Snapshot ID: `{snapshot_id}`",
+                title="🔁 Confirm Restore",
+            ),
+            ephemeral=True,
+        )
+        return
+
+    async with AsyncSessionLocal() as session:
+        async with session.begin():
+            guild = await _require_admin(session, interaction)
+            if not guild:
+                return
+
+            svc = SnapshotService(session)
+
+            # Support short IDs — scan tournament snapshots
+            snap = await svc.get_snapshot(snapshot_id)
+            if not snap:
+                q = select(type(None))  # placeholder; search by prefix below
+                from app.database.models.snapshot import TournamentSnapshot
+                prefix_q = (
+                    select(TournamentSnapshot)
+                    .where(TournamentSnapshot.organization_id == guild.organization_id)
+                    .where(TournamentSnapshot.id.startswith(snapshot_id))
+                    .limit(1)
+                )
+                result = await session.execute(prefix_q)
+                snap = result.scalar_one_or_none()
+
+            if not snap:
+                await interaction.followup.send(embed=error_embed(f"Snapshot `{snapshot_id}` not found."), ephemeral=True)
+                return
+
+            if snap.organization_id != guild.organization_id:
+                await interaction.followup.send(embed=error_embed("Access denied."), ephemeral=True)
+                return
+
+            state = snap.state or {}
+            t_meta = state.get("tournament", {})
+            tournament_id = t_meta.get("id") or snap.tournament_id
+
+            t_repo = TournamentRepository(session)
+            tournament = await t_repo.get_by_id(tournament_id, guild.organization_id)
+            if not tournament:
+                await interaction.followup.send(embed=error_embed("Tournament not found."), ephemeral=True)
+                return
+
+            # Restore tournament status
+            if t_meta.get("status"):
+                try:
+                    tournament.status = TournamentStatus(t_meta["status"])
+                except ValueError:
+                    pass
+
+            # Restore standings
+            snap_standings = state.get("standings", [])
+            if snap_standings:
+                existing_q = select(Standings).where(
+                    Standings.organization_id == guild.organization_id,
+                    Standings.tournament_id == tournament_id,
+                )
+                existing = {s.team_id: s for s in (await session.execute(existing_q)).scalars().all()}
+                for row in snap_standings:
+                    s = existing.get(row["team_id"])
+                    if s:
+                        s.rank = row.get("rank")
+                        s.wins = row.get("wins", 0)
+                        s.losses = row.get("losses", 0)
+                        s.points = row.get("points", 0)
+
+            # Audit log
+            session.add(AuditLog(
+                organization_id=guild.organization_id,
+                tournament_id=tournament_id,
+                actor_id=str(interaction.user.id),
+                actor_type="staff",
+                action="snapshot_restore",
+                details={
+                    "snapshot_id": snap.id,
+                    "snapshot_trigger": snap.trigger,
+                    "restored_status": t_meta.get("status"),
+                    "restored_by": str(interaction.user.id),
+                },
+            ))
+
+    await interaction.followup.send(
+        embed=success_embed(
+            f"Tournament **{tournament.name}** restored to snapshot `{snap.id[:8]}`.\n"
+            f"Snapshot label: **{snap.label or snap.trigger}**\n"
+            f"Status restored to: **{t_meta.get('status', 'unchanged')}**\n"
+            f"Standings restored: **{len(snap_standings)} teams**",
+            title="🔁 Snapshot Restored",
+        ),
+        ephemeral=True,
+    )
+    logger.info(
+        "override.restore: tournament=%s snap=%s by=%s",
+        tournament_id[:8], snap.id[:8], interaction.user.id,
+    )
 
 
 async def setup(bot: commands.Bot) -> None:
