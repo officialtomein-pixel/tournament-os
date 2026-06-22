@@ -11,7 +11,7 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 
-from sqlalchemy import select, update
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models.background_job import BackgroundJob
@@ -25,13 +25,13 @@ MAX_ATTEMPTS = 3
 
 async def _claim_pending_jobs(session: AsyncSession) -> list[BackgroundJob]:
     """Fetch and claim up to 10 pending jobs that are ready to run."""
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc)
     q = (
         select(BackgroundJob)
         .where(BackgroundJob.status == "pending")
         .where(BackgroundJob.attempts < MAX_ATTEMPTS)
         .where(
-            (BackgroundJob.run_after.is_(None)) | (BackgroundJob.run_after <= now)
+            (BackgroundJob.run_after.is_(None)) | (BackgroundJob.run_after <= func.now())
         )
         .order_by(BackgroundJob.created_at.asc())
         .limit(10)
@@ -164,7 +164,7 @@ async def enqueue(
                 job_type=job_type,
                 payload=payload,
                 status="pending",
-                run_after=run_after.isoformat() if run_after else None,
+                run_after=run_after,
             )
             session.add(job)
     logger.debug("Enqueued job type=%s", job_type)
@@ -185,7 +185,7 @@ async def run_job_queue_worker() -> None:
                         try:
                             await _process_job(job, session)
                             job.status = "completed"
-                            job.completed_at = datetime.now(timezone.utc).isoformat()
+                            job.completed_at = datetime.now(timezone.utc)
                         except Exception as exc:
                             logger.error(
                                 "Job %s type=%s failed (attempt %d/%d): %s",
