@@ -1,6 +1,9 @@
 """
-Notification event subscribers — listen for domain events and dispatch notifications.
-Registered at startup by calling register_all().
+Notification event subscribers — listen for domain events and dispatch
+real Discord notifications via discord_delivery.
+
+Registered at startup by importing this module (decorators fire at import time).
+Call register_all() explicitly if you need a no-op hook (e.g. for testing).
 """
 import logging
 
@@ -8,6 +11,81 @@ from app.events.bus import event_bus
 
 logger = logging.getLogger(__name__)
 
+
+# ── Internal DB helpers ───────────────────────────────────────────────────────
+
+async def _get_tournament_info(tournament_id: str, organization_id: str) -> dict:
+    """Fetch tournament name + guild channel config for notification delivery."""
+    try:
+        from app.database.session import AsyncSessionLocal
+        from app.database.models.tournament import Tournament
+        from app.database.models.guild import Guild
+        from sqlalchemy import select
+
+        async with AsyncSessionLocal() as session:
+            t = await session.get(Tournament, tournament_id)
+            if not t:
+                return {}
+
+            guild_q = select(Guild).where(
+                Guild.organization_id == organization_id,
+                Guild.deleted_at.is_(None),
+            ).limit(1)
+            guild = (await session.execute(guild_q)).scalar_one_or_none()
+            guild_settings: dict = (guild.settings or {}) if guild else {}
+            channel_ids: dict = guild_settings.get("channel_ids", {})
+            tc: dict = t.channel_config or {}
+
+            return {
+                "name": t.name,
+                "format": t.format.value if t.format else None,
+                "announcements_channel_id": (
+                    channel_ids.get("announcements")
+                    or tc.get("announcements_channel_id")
+                ),
+                "schedule_channel_id": (
+                    channel_ids.get("schedule")
+                    or tc.get("schedule_channel_id")
+                ),
+                "staff_alerts_channel_id": (
+                    channel_ids.get("staff_alerts")
+                    or channel_ids.get("admin")
+                    or tc.get("control_channel_id")
+                ),
+            }
+    except Exception as exc:
+        logger.warning("_get_tournament_info failed: %s", exc)
+        return {}
+
+
+async def _get_user_discord_id(registration_id: str) -> tuple[str | None, str | None]:
+    """Return (discord_id, team_name) for a registration."""
+    try:
+        from app.database.session import AsyncSessionLocal
+        from app.database.models.registration import Registration
+        from app.database.models.team import Team
+        from sqlalchemy import select
+
+        async with AsyncSessionLocal() as session:
+            reg = await session.get(Registration, registration_id)
+            if not reg:
+                return None, None
+
+            discord_id = reg.discord_user_id
+            team_name: str | None = None
+
+            if reg.team_id:
+                team = await session.get(Team, reg.team_id)
+                if team:
+                    team_name = team.name
+
+            return discord_id, team_name
+    except Exception as exc:
+        logger.warning("_get_user_discord_id failed: %s", exc)
+        return None, None
+
+
+# ── Event subscribers ─────────────────────────────────────────────────────────
 
 @event_bus.subscribe("RegistrationSubmitted")
 async def on_registration_submitted(payload: dict) -> None:
@@ -17,6 +95,22 @@ async def on_registration_submitted(payload: dict) -> None:
         payload.get("tournament_id"),
         payload.get("has_duplicates"),
     )
+    # Staff alert: new pending registration
+    t_info = await _get_tournament_info(
+        payload.get("tournament_id", ""),
+        payload.get("organization_id", ""),
+    )
+    if t_info.get("staff_alerts_channel_id") and payload.get("has_duplicates"):
+        from app.services.notification.discord_delivery import _post_to_channel
+        import discord
+        e = discord.Embed(
+            title="⚠️ Duplicate Registration Detected",
+            description=f"A registration with possible duplicates was submitted for **{t_info.get('name', 'tournament')}**.",
+            color=discord.Color.yellow(),
+        )
+        e.add_field(name="Reg ID", value=payload.get("registration_id", "")[:8], inline=True)
+        e.set_footer(text="Review in the Registration panel.")
+        await _post_to_channel(t_info["staff_alerts_channel_id"], e)
 
 
 @event_bus.subscribe("RegistrationApproved")
@@ -26,6 +120,19 @@ async def on_registration_approved(payload: dict) -> None:
         payload.get("registration_id"),
         payload.get("reviewed_by"),
     )
+    reg_id = payload.get("registration_id", "")
+    t_info = await _get_tournament_info(
+        payload.get("tournament_id", ""),
+        payload.get("organization_id", ""),
+    )
+    discord_id, team_name = await _get_user_discord_id(reg_id)
+    if discord_id and t_info.get("name"):
+        from app.services.notification.discord_delivery import notify_registration_approved
+        await notify_registration_approved(
+            discord_id=discord_id,
+            tournament_name=t_info["name"],
+            team_name=team_name,
+        )
 
 
 @event_bus.subscribe("RegistrationRejected")
@@ -35,6 +142,19 @@ async def on_registration_rejected(payload: dict) -> None:
         payload.get("registration_id"),
         payload.get("reason"),
     )
+    reg_id = payload.get("registration_id", "")
+    t_info = await _get_tournament_info(
+        payload.get("tournament_id", ""),
+        payload.get("organization_id", ""),
+    )
+    discord_id, _ = await _get_user_discord_id(reg_id)
+    if discord_id and t_info.get("name"):
+        from app.services.notification.discord_delivery import notify_registration_rejected
+        await notify_registration_rejected(
+            discord_id=discord_id,
+            tournament_name=t_info["name"],
+            reason=payload.get("reason"),
+        )
 
 
 @event_bus.subscribe("MatchStarted")
@@ -58,16 +178,44 @@ async def on_dispute_opened(payload: dict) -> None:
         payload.get("dispute_id"),
         payload.get("case_type"),
     )
+    t_info = await _get_tournament_info(
+        payload.get("tournament_id", ""),
+        payload.get("organization_id", ""),
+    )
+    if t_info.get("staff_alerts_channel_id"):
+        from app.services.notification.discord_delivery import notify_dispute_opened
+        await notify_dispute_opened(
+            dispute_id_short=payload.get("dispute_id", "")[:8],
+            tournament_name=t_info.get("name", "Tournament"),
+            case_type=payload.get("case_type", "unknown"),
+            description=payload.get("description", "A new dispute has been opened."),
+            staff_alerts_channel_id=t_info["staff_alerts_channel_id"],
+            opener_discord_id=payload.get("opener_discord_id"),
+        )
 
 
 @event_bus.subscribe("TournamentStatusChanged")
 async def on_tournament_status_changed(payload: dict) -> None:
+    old = payload.get("old_status", "")
+    new = payload.get("new_status", "")
     logger.info(
         "Tournament status changed: tournament_id=%s %s -> %s",
         payload.get("tournament_id"),
-        payload.get("old_status"),
-        payload.get("new_status"),
+        old,
+        new,
     )
+    t_info = await _get_tournament_info(
+        payload.get("tournament_id", ""),
+        payload.get("organization_id", ""),
+    )
+    if t_info.get("announcements_channel_id") and t_info.get("name"):
+        from app.services.notification.discord_delivery import notify_tournament_status
+        await notify_tournament_status(
+            tournament_name=t_info["name"],
+            new_status=new,
+            announcements_channel_id=t_info["announcements_channel_id"],
+            extra_info=payload.get("extra_info"),
+        )
 
 
 def register_all() -> None:

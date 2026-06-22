@@ -1,8 +1,14 @@
 """
 Match score submission and override service.
 All multi-step operations are wrapped in a transaction at the caller level.
-After a winner is recorded, BracketAdvancement is called to slot the winner
-into the next match (single/double/triple elimination formats).
+
+Two submission flows:
+  1. Staff/referee submits final result directly → submit_score()
+  2. Each team captain submits their result independently → submit_team_score_claim()
+     • Both agree   → auto-approved, match completed immediately
+     • Both disagree → auto-dispute created, match set to PROTESTED
+
+After a winner is recorded, BracketAdvancement slots the winner into the next match.
 """
 import logging
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -92,6 +98,152 @@ class ScoreHandler:
 
         return updated
 
+    async def submit_team_score_claim(
+        self,
+        match_id: str,
+        tournament_id: str,
+        organization_id: str,
+        claiming_team_id: str,
+        submitted_by_discord_id: str,
+        winner_team_id: str,
+        score: dict | None = None,
+    ) -> str:
+        """
+        Record a team captain's score claim. Called once per team.
+
+        Returns one of:
+          "pending"       — waiting for the other team to submit
+          "auto_approved" — both teams agreed; match auto-completed
+          "disputed"      — teams disagreed; auto-dispute opened, match → PROTESTED
+        """
+        match = await self.repo.get_by_id(match_id, organization_id, tournament_id)
+        if not match:
+            raise ValueError(f"Match {match_id} not found")
+
+        full_match_id = match.id
+        tournament_id = match.tournament_id
+
+        if match.status == MatchStatus.COMPLETED:
+            raise ValueError("Match is already completed.")
+
+        if claiming_team_id not in (match.team1_id, match.team2_id):
+            raise ValueError("Your team is not a participant in this match.")
+
+        # Store claim in settings JSONB
+        settings: dict = dict(match.settings or {})
+        pending: dict = dict(settings.get("pending_score_claims", {}))
+
+        pending[claiming_team_id] = {
+            "winner_id": winner_team_id,
+            "score": score or {},
+            "submitted_by": submitted_by_discord_id,
+        }
+        settings["pending_score_claims"] = pending
+        match.settings = settings
+        await self.session.flush()
+
+        await self.audit.log(
+            organization_id=organization_id,
+            tournament_id=tournament_id,
+            action="match.team_score_claim",
+            actor_id=submitted_by_discord_id,
+            target_type="match",
+            target_id=full_match_id,
+            payload={"team_id": claiming_team_id, "claimed_winner": winner_team_id},
+        )
+
+        # Check if both teams have submitted
+        team1_claim = pending.get(match.team1_id) if match.team1_id else None
+        team2_claim = pending.get(match.team2_id) if match.team2_id else None
+
+        if not team1_claim or not team2_claim:
+            logger.info(
+                "Match %s: score claim from team %s recorded — awaiting other team",
+                full_match_id[:8], claiming_team_id[:8],
+            )
+            return "pending"
+
+        # Both teams submitted — resolve
+        agreed = team1_claim["winner_id"] == team2_claim["winner_id"]
+
+        # Clear pending claims
+        settings.pop("pending_score_claims", None)
+        match.settings = settings
+        await self.session.flush()
+
+        if agreed:
+            winner_id = team1_claim["winner_id"]
+            loser_id = (
+                match.team2_id if winner_id == match.team1_id
+                else match.team1_id
+            )
+
+            # Use the winner's team's submitted score as authoritative
+            if winner_id == match.team1_id:
+                score_team1 = team1_claim.get("score") or {}
+                score_team2 = team2_claim.get("score") or {}
+            else:
+                score_team1 = team2_claim.get("score") or {}
+                score_team2 = team1_claim.get("score") or {}
+
+            logger.info(
+                "Match %s: both teams agree — winner=%s, auto-approving",
+                full_match_id[:8], winner_id[:8] if winner_id else "None",
+            )
+            await self.submit_score(
+                match_id=full_match_id,
+                tournament_id=tournament_id,
+                organization_id=organization_id,
+                submitted_by="auto_approval:score_agreement",
+                score_team1=score_team1,
+                score_team2=score_team2,
+                winner_id=winner_id,
+                loser_id=loser_id,
+            )
+            return "auto_approved"
+        else:
+            # Scores disagree — create auto-dispute and flag the match
+            logger.info(
+                "Match %s: teams disagree on winner — opening auto-dispute",
+                full_match_id[:8],
+            )
+            match.status = MatchStatus.PROTESTED
+            await self.session.flush()
+
+            await self.audit.log(
+                organization_id=organization_id,
+                tournament_id=tournament_id,
+                action="match.score_dispute_auto_opened",
+                actor_id="system",
+                target_type="match",
+                target_id=full_match_id,
+                payload={
+                    "team1_claim": team1_claim,
+                    "team2_claim": team2_claim,
+                },
+            )
+
+            # Publish dispute event so staff gets notified
+            try:
+                from app.services.dispute.case_manager import DisputeCaseManager
+                dispute_mgr = DisputeCaseManager(self.session)
+                await dispute_mgr.open_case(
+                    organization_id=organization_id,
+                    tournament_id=tournament_id,
+                    match_id=full_match_id,
+                    case_type="score_dispute",
+                    opened_by="system",
+                    description=(
+                        f"Auto-dispute: Teams submitted conflicting scores.\n"
+                        f"Team1 claims winner: {team1_claim['winner_id']}\n"
+                        f"Team2 claims winner: {team2_claim['winner_id']}"
+                    ),
+                )
+            except Exception as exc:
+                logger.error("Failed to open auto-dispute for match %s: %s", full_match_id[:8], exc)
+
+            return "disputed"
+
     async def _advance_bracket(
         self,
         completed_match: Match,
@@ -130,11 +282,9 @@ class ScoreHandler:
                 tournament_id=tournament_id,
             )
         except Exception as e:
-            # Non-fatal — log and continue; standings are already saved
             logger.error(
                 "Bracket advancement failed for match %s: %s", completed_match.id, e, exc_info=True
             )
-            # Write an audit entry so staff can discover the failure without log access
             try:
                 await self.audit.log(
                     organization_id=organization_id,
@@ -146,7 +296,7 @@ class ScoreHandler:
                     payload={"error": str(e)},
                 )
             except Exception:
-                pass  # audit failure must never crash the score submission
+                pass
 
     async def submit_battle_royale(
         self,
@@ -163,7 +313,7 @@ class ScoreHandler:
         match = await self.repo.get_by_id(match_id, organization_id, tournament_id)
         if not match:
             raise ValueError(f"Match {match_id} not found")
-        match_id = match.id  # normalize short ID to full UUID
+        match_id = match.id
         tournament_id = match.tournament_id
 
         saved: list[BattleRoyaleResult] = []

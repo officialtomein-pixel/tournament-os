@@ -18,7 +18,6 @@ import sys
 class _IPv4SelectorEventLoop(asyncio.SelectorEventLoop):
     """SelectorEventLoop that resolves DNS to IPv4 addresses only."""
     async def getaddrinfo(self, host, port, *, family=0, type=0, proto=0, flags=0):
-        # Ignore the caller's family hint — always request AF_INET.
         return await super().getaddrinfo(
             host, port,
             family=socket.AF_INET,
@@ -54,7 +53,6 @@ class TournamentBot(commands.Bot):
         intents = discord.Intents.default()
         intents.message_content = True
         intents.members = True
-        # Belt-and-suspenders: also force IPv4 on aiohttp's TCP connector.
         connector = aiohttp.TCPConnector(family=socket.AF_INET)
         super().__init__(
             command_prefix="!",
@@ -212,6 +210,12 @@ class TournamentBot(commands.Bot):
 
     async def on_ready(self) -> None:
         logger.info("Bot ready: %s (ID: %s)", self.user, self.user.id)
+
+        # Register this bot instance with the Discord notification delivery service
+        # so event subscribers can send real DMs and channel messages.
+        from app.services.notification.discord_delivery import set_bot
+        set_bot(self)
+
         await self.change_presence(activity=discord.Activity(
             type=discord.ActivityType.watching,
             name="tournaments | /setup tournament",
