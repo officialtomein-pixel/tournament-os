@@ -30,6 +30,9 @@ _SECTIONS = {
     "cp_status":   ("🔄 Change Status", discord.ButtonStyle.success),
     "cp_audit":    ("📜 Audit Trail",   discord.ButtonStyle.secondary),
     "cp_snap":     ("📸 Snapshots",     discord.ButtonStyle.secondary),
+    "cp_override": ("🛠️ Overrides",    discord.ButtonStyle.danger),
+    "cp_settings": ("⚙️ Settings",      discord.ButtonStyle.secondary),
+    "cp_search":   ("🔍 Search",        discord.ButtonStyle.primary),
 }
 
 
@@ -73,6 +76,9 @@ class ControlPanelView(discord.ui.View):
             "cp_status":   _panel_status,
             "cp_audit":    _panel_audit,
             "cp_snap":     _panel_snapshots,
+            "cp_override": _panel_overrides,
+            "cp_settings": _panel_settings,
+            "cp_search":   _panel_search,
         }
         handler = handlers.get(section)
         if handler:
@@ -397,7 +403,7 @@ async def _panel_snapshots(interaction: discord.Interaction, t_id: str) -> None:
 
     embed = discord.Embed(title=f"📸 Snapshots — {t.name}", color=discord.Color.blurple())
     if not snapshots:
-        embed.description = "No snapshots yet. Snapshots are auto-taken at key lifecycle events.\nUse `/override snapshot` to take one now."
+        embed.description = "No snapshots yet. Auto-taken at key lifecycle events.\nUse **🛠️ Overrides → 📸 Take Snapshot** to create one."
     else:
         for snap in snapshots:
             ts = f"<t:{int(snap.created_at.timestamp())}:f>" if snap.created_at else "unknown"
@@ -768,3 +774,107 @@ class _AnnouncementModal(discord.ui.Modal, title="Post Announcement"):
 
         await ann_ch.send(content=ping_text, embed=embed)
         await interaction.followup.send(f"✅ Announcement posted in {ann_ch.mention}.", ephemeral=True)
+
+
+# ── Override / Settings / Search panels ───────────────────────────────────────
+
+async def _panel_overrides(interaction: discord.Interaction, t_id: str) -> None:
+    """Open the Override sub-panel — all staff override operations as buttons."""
+    await interaction.response.defer(ephemeral=True)
+    from app.database.session import AsyncSessionLocal
+    from app.database.models.staff import StaffRole
+    from app.bot.helpers.permissions import has_permission
+    from app.bot.views.override_panel_view import OverridePanelView
+
+    async with AsyncSessionLocal() as session:
+        if not await has_permission(session, interaction.user, str(interaction.guild_id), StaffRole.TOURNAMENT_ADMIN):
+            await interaction.followup.send("❌ Tournament Admin role required.", ephemeral=True)
+            return
+        guild, t = await _get_tournament(session, t_id, interaction.guild_id)
+        if not t:
+            await interaction.followup.send("Tournament not found.", ephemeral=True)
+            return
+        t_name = t.name
+        org_id = t.organization_id
+
+    embed = discord.Embed(
+        title=f"🛠️ Override Tools — {t_name}",
+        description=(
+            "Use the buttons below to perform staff overrides.\n"
+            "All actions are **logged to the audit trail**.\n\n"
+            "🚫 **DQ Team** — disqualify a team\n"
+            "⚔️ **Set Winner** — force-declare a match winner\n"
+            "⏩ **Advance Round** — skip to next round\n"
+            "👻 **Forfeit No-shows** — remove absent teams\n"
+            "📸 **Take Snapshot** — capture current state\n"
+            "🔁 **Restore Snapshot** — roll back to a snapshot"
+        ),
+        color=discord.Color.red(),
+    )
+    view = OverridePanelView(tournament_id=t_id, org_id=org_id, tournament_name=t_name)
+    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+
+async def _panel_settings(interaction: discord.Interaction, t_id: str) -> None:
+    """Open the Settings sub-panel — feature flags + webhook management."""
+    await interaction.response.defer(ephemeral=True)
+    from app.database.session import AsyncSessionLocal
+    from app.database.models.staff import StaffRole
+    from app.bot.helpers.permissions import has_permission
+    from app.bot.views.settings_panel_view import SettingsPanelView, _KNOWN_FLAGS
+
+    async with AsyncSessionLocal() as session:
+        if not await has_permission(session, interaction.user, str(interaction.guild_id), StaffRole.TOURNAMENT_ADMIN):
+            await interaction.followup.send("❌ Tournament Admin role required.", ephemeral=True)
+            return
+        guild, t = await _get_tournament(session, t_id, interaction.guild_id)
+        if not t:
+            await interaction.followup.send("Tournament not found.", ephemeral=True)
+            return
+        current_flags = dict(t.feature_flags or {})
+        t_name = t.name
+        org_id = t.organization_id
+
+    embed = discord.Embed(
+        title=f"⚙️ Settings — {t_name}",
+        color=discord.Color.greyple(),
+    )
+    for key, desc in _KNOWN_FLAGS.items():
+        val = current_flags.get(key)
+        icon = "✅" if val is True else ("❌" if val is False else "⬜ default")
+        embed.add_field(name=f"{icon}  `{key}`", value=desc, inline=False)
+
+    embed.set_footer(text="Click a flag button to toggle it. Use the webhook buttons to manage outbound webhooks.")
+    view = SettingsPanelView(
+        tournament_id=t_id,
+        org_id=org_id,
+        tournament_name=t_name,
+        current_flags=current_flags,
+    )
+    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+
+async def _panel_search(interaction: discord.Interaction, t_id: str) -> None:
+    """Open the Search sub-panel — find tournaments, teams, matches."""
+    await interaction.response.defer(ephemeral=True)
+    from app.database.session import AsyncSessionLocal
+    from app.bot.views.search_panel_view import SearchPanelView
+
+    async with AsyncSessionLocal() as session:
+        guild, t = await _get_tournament(session, t_id, interaction.guild_id)
+        if not t:
+            await interaction.followup.send("Tournament not found.", ephemeral=True)
+            return
+        org_id = t.organization_id
+
+    embed = discord.Embed(
+        title="🔍 Search",
+        description=(
+            "📅 **Find Tournament** — search by name or game\n"
+            "👥 **Find Team** — look up a team, or find your own team\n"
+            "🎮 **Find Matches** — list matches by tournament and round"
+        ),
+        color=discord.Color.blurple(),
+    )
+    view = SearchPanelView(org_id=org_id)
+    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
