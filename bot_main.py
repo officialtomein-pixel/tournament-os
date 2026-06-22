@@ -72,6 +72,7 @@ class TournamentBot(commands.Bot):
             "app.bot.cogs.ai_assistant_cog",
             "app.bot.cogs.dispute_cog",
             "app.bot.cogs.override_cog",
+            "app.bot.cogs.search_cog",
         ]
         for cog in cog_modules:
             try:

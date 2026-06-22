@@ -132,6 +132,10 @@ class Tournament(Base, TimestampMixin, SoftDeleteMixin):
     match_channel_config: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     # 2.0: Group stage config — number of groups, teams per group, advancement rules
     group_config: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    # 2.0: Feature flags — per-tournament toggles without schema changes
+    # Example: {"score_auto_approval": true, "checkin_required": false,
+    #            "allow_score_edit": false, "ai_moderation": true}
+    feature_flags: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
 
     created_by: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("users.id"), nullable=False)
 

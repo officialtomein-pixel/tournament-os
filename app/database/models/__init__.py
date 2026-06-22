@@ -15,6 +15,7 @@ from app.database.models.evidence import EvidenceFile
 from app.database.models.ai_session import AISession
 from app.database.models.background_job import BackgroundJob
 from app.database.models.staff import StaffMember
+from app.database.models.snapshot import TournamentSnapshot
 
 __all__ = [
     "Organization", "Guild", "User", "Tournament",
@@ -25,4 +26,5 @@ __all__ = [
     "Dispute", "DisputeMessage",
     "AuditLog", "Notification", "EvidenceFile",
     "AISession", "BackgroundJob", "StaffMember",
+    "TournamentSnapshot",
 ]

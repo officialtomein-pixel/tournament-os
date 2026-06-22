@@ -203,16 +203,15 @@ async def on_dispute_opened(payload: dict) -> None:
 async def on_tournament_status_changed(payload: dict) -> None:
     old = payload.get("old_status", "")
     new = payload.get("new_status", "")
+    tournament_id = payload.get("tournament_id", "")
+    organization_id = payload.get("organization_id", "")
     logger.info(
         "Tournament status changed: tournament_id=%s %s -> %s",
-        payload.get("tournament_id"),
+        tournament_id,
         old,
         new,
     )
-    t_info = await _get_tournament_info(
-        payload.get("tournament_id", ""),
-        payload.get("organization_id", ""),
-    )
+    t_info = await _get_tournament_info(tournament_id, organization_id)
     if t_info.get("announcements_channel_id") and t_info.get("name"):
         from app.services.notification.discord_delivery import notify_tournament_status
         await notify_tournament_status(
@@ -221,6 +220,20 @@ async def on_tournament_status_changed(payload: dict) -> None:
             announcements_channel_id=t_info["announcements_channel_id"],
             extra_info=payload.get("extra_info"),
         )
+
+    # Auto-snapshot at key lifecycle transitions
+    if new in ("completed", "live") and tournament_id and organization_id:
+        try:
+            from app.database.session import AsyncSessionLocal
+            from app.services.snapshot.snapshot_service import SnapshotService
+            trigger = "tournament_completed" if new == "completed" else "tournament_live"
+            label = f"Auto: {old} → {new}"
+            async with AsyncSessionLocal() as s:
+                async with s.begin():
+                    svc = SnapshotService(s)
+                    await svc.take(organization_id, tournament_id, trigger=trigger, label=label)
+        except Exception as exc:
+            logger.warning("Auto-snapshot failed for tournament %s: %s", tournament_id[:8], exc)
 
 
 def register_all() -> None:
