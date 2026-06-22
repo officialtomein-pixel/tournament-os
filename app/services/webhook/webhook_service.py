@@ -129,7 +129,7 @@ async def _deliver_inner(
 
 def register_webhook_subscriber() -> None:
     """Wire the webhook service into the event bus for all event types."""
-    from app.events.event_bus import event_bus
+    from app.events.bus import event_bus
 
     @event_bus.subscribe("TournamentStatusChanged")
     async def _wh_status(payload: dict) -> None:
