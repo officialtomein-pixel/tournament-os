@@ -21,6 +21,35 @@ from datetime import datetime, timezone
 logger = logging.getLogger(__name__)
 
 
+async def _process_checkin_close(tournament_id: str, organization_id: str) -> None:
+    """Run no-show handler when check-in window closes.
+
+    Removes unchecked teams (if auto_removal_policy.enabled) and promotes
+    reserves to fill their slots.  Fires a Discord notification with the tally.
+    """
+    try:
+        from app.database.session import AsyncSessionLocal
+        from app.services.checkin.noshow_handler import NoShowHandler
+
+        async with AsyncSessionLocal() as session:
+            async with session.begin():
+                handler = NoShowHandler(session)
+                result = await handler.process_noshows(organization_id, tournament_id)
+
+        removed = result.get("removed", [])
+        promoted = result.get("promoted", [])
+        if removed or promoted:
+            logger.info(
+                "Scheduler: check-in close — %d removed, %d promoted — tournament=%s",
+                len(removed), len(promoted), tournament_id[:8],
+            )
+    except Exception as exc:
+        logger.error(
+            "Scheduler: noshow_handler failed for tournament %s: %s",
+            tournament_id[:8], exc, exc_info=True,
+        )
+
+
 async def _auto_generate_bracket(tournament_id: str, organization_id: str, t_format) -> None:
     """Generate bracket for a tournament that just went LIVE, if not already done."""
     try:
@@ -154,6 +183,10 @@ async def _run_once() -> None:
                         )
                     except Exception as exc:
                         logger.warning("Failed to fire status event for %s: %s", t_id[:8], exc)
+
+                # When check-in closes, enforce no-show removal
+                if new_status == TournamentStatus.CHECKIN_CLOSED:
+                    asyncio.create_task(_process_checkin_close(t_id, t_org))
 
                 # When going LIVE, auto-generate the bracket
                 if going_live:

@@ -71,6 +71,7 @@ class TournamentBot(commands.Bot):
             "app.bot.cogs.match_cog",
             "app.bot.cogs.ai_assistant_cog",
             "app.bot.cogs.dispute_cog",
+            "app.bot.cogs.override_cog",
         ]
         for cog in cog_modules:
             try:
