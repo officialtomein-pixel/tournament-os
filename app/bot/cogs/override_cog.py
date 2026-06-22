@@ -317,5 +317,59 @@ async def override_forfeit_noshows(
     )
 
 
+# ── /override snapshot ────────────────────────────────────────────────────────
+
+@override_group.command(name="snapshot", description="Take a manual snapshot of a tournament's current state")
+@app_commands.describe(
+    tournament_id="Tournament ID",
+    label="Optional label for this snapshot",
+)
+async def override_snapshot(
+    interaction: discord.Interaction,
+    tournament_id: str,
+    label: str = "manual",
+) -> None:
+    await interaction.response.defer(ephemeral=True)
+    from app.database.session import AsyncSessionLocal
+    from app.database.repositories.tournament import TournamentRepository
+    from app.services.snapshot.snapshot_service import SnapshotService
+    from app.bot.helpers.formatters import success_embed, error_embed
+
+    async with AsyncSessionLocal() as session:
+        async with session.begin():
+            guild = await _require_admin(session, interaction)
+            if not guild:
+                return
+
+            t_repo = TournamentRepository(session)
+            tournament = await t_repo.get_by_id(tournament_id, guild.organization_id)
+            if not tournament:
+                await interaction.followup.send(embed=error_embed("Tournament not found."), ephemeral=True)
+                return
+
+            try:
+                svc = SnapshotService(session)
+                snap = await svc.take_snapshot(
+                    tournament_id=tournament.id,
+                    organization_id=guild.organization_id,
+                    trigger="manual",
+                    label=label,
+                )
+            except Exception as exc:
+                await interaction.followup.send(embed=error_embed(f"Snapshot failed: {exc}"), ephemeral=True)
+                return
+
+    await interaction.followup.send(
+        embed=success_embed(
+            f"Snapshot `{snap.id[:8]}` saved for **{tournament.name}**.\n"
+            f"Label: **{label}**\n"
+            f"Use `/audit snapshot {tournament_id}` to view all snapshots.",
+            title="📸 Snapshot Created",
+        ),
+        ephemeral=True,
+    )
+    logger.info("override.snapshot: tournament=%s snap=%s by=%s", tournament_id[:8], snap.id[:8], interaction.user.id)
+
+
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(OverrideCog(bot))

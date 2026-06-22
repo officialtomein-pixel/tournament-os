@@ -64,8 +64,19 @@ class RegistrationApprovalService:
         await self.session.flush()
         await self.session.refresh(reg)
 
-        if initial_status == RegistrationStatus.AUTO_APPROVED:
+        # Auto-create team for solo players when flag is enabled OR auto-approved
+        solo_auto_team: bool = (tournament.feature_flags or {}).get("solo_auto_team", False)
+        should_create_team = (
+            initial_status == RegistrationStatus.AUTO_APPROVED
+            or (solo_auto_team and initial_status in (RegistrationStatus.PENDING, RegistrationStatus.AUTO_APPROVED))
+        )
+        if should_create_team:
             await self._create_team_for_registration(tournament, reg, user.id, form_data)
+            if initial_status == RegistrationStatus.PENDING and solo_auto_team:
+                logger.info(
+                    "solo_auto_team: created team immediately for pending reg %s in tournament %s",
+                    reg.id[:8], tournament.id[:8],
+                )
 
         await self.audit.log(
             organization_id=tournament.organization_id,

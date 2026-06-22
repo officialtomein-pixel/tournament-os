@@ -28,6 +28,8 @@ _SECTIONS = {
     "cp_announce": ("📢 Announce",      discord.ButtonStyle.secondary),
     "cp_fields":   ("📝 Reg Fields",    discord.ButtonStyle.primary),
     "cp_status":   ("🔄 Change Status", discord.ButtonStyle.success),
+    "cp_audit":    ("📜 Audit Trail",   discord.ButtonStyle.secondary),
+    "cp_snap":     ("📸 Snapshots",     discord.ButtonStyle.secondary),
 }
 
 
@@ -69,6 +71,8 @@ class ControlPanelView(discord.ui.View):
             "cp_announce": _panel_announce,
             "cp_fields":   _panel_fields,
             "cp_status":   _panel_status,
+            "cp_audit":    _panel_audit,
+            "cp_snap":     _panel_snapshots,
         }
         handler = handlers.get(section)
         if handler:
@@ -317,6 +321,92 @@ async def _panel_fields(interaction: discord.Interaction, t_id: str) -> None:
 
     view = _FieldManageView(t_id, org_id)
     await interaction.followup.send(embed=e, view=view, ephemeral=True)
+
+
+async def _panel_audit(interaction: discord.Interaction, t_id: str) -> None:
+    """Show recent audit events for this tournament."""
+    await interaction.response.defer(ephemeral=True)
+    from app.database.session import AsyncSessionLocal
+    from app.database.repositories.audit import AuditRepository
+
+    _ACTION_ICONS: dict[str, str] = {
+        "tournament.status_changed": "🔄",
+        "team.disqualified":         "🚫",
+        "match.override_winner":     "⚔️",
+        "bracket.advanced":          "⏩",
+        "noshow.processed":          "👻",
+        "registration.approved":     "✅",
+        "registration.rejected":     "❌",
+        "registration.flagged":      "🚩",
+        "score.submitted":           "📝",
+        "score.override":            "⚠️",
+        "snapshot.created":          "📸",
+    }
+
+    async with AsyncSessionLocal() as session:
+        guild, t = await _get_tournament(session, t_id, interaction.guild_id)
+        if not t:
+            await interaction.followup.send("Tournament not found.", ephemeral=True)
+            return
+        audit_repo = AuditRepository(session)
+        entries = await audit_repo.list_for_tournament(t.organization_id, t.id, limit=15)
+
+    embed = discord.Embed(
+        title=f"📜 Audit Trail — {t.name}",
+        color=discord.Color.blurple(),
+        description=f"Last **{len(entries)}** events (newest first)" if entries else "No events recorded yet.",
+    )
+    lines = []
+    for entry in entries:
+        icon = _ACTION_ICONS.get(entry.action, "📋")
+        ts = f"<t:{int(entry.created_at.timestamp())}:R>" if entry.created_at else ""
+        action_label = entry.action.replace(".", " › ").replace("_", " ").title()
+        detail = ""
+        if entry.payload:
+            if "old_status" in entry.payload and "new_status" in entry.payload:
+                detail = f" `{entry.payload['old_status']}→{entry.payload['new_status']}`"
+            elif "reason" in entry.payload:
+                detail = f" — {entry.payload['reason'][:30]}"
+        actor = f"`{entry.actor_type or 'system'}`"
+        lines.append(f"{icon} {ts} **{action_label}**{detail} by {actor}")
+
+    if lines:
+        embed.description = "\n".join(lines)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+async def _panel_snapshots(interaction: discord.Interaction, t_id: str) -> None:
+    """Show available snapshots for this tournament."""
+    await interaction.response.defer(ephemeral=True)
+    from app.database.session import AsyncSessionLocal
+    from app.database.models.snapshot import TournamentSnapshot
+    from sqlalchemy import select
+
+    async with AsyncSessionLocal() as session:
+        guild, t = await _get_tournament(session, t_id, interaction.guild_id)
+        if not t:
+            await interaction.followup.send("Tournament not found.", ephemeral=True)
+            return
+        snap_q = (
+            select(TournamentSnapshot)
+            .where(TournamentSnapshot.tournament_id == t.id)
+            .order_by(TournamentSnapshot.created_at.desc())
+            .limit(10)
+        )
+        snapshots = (await session.execute(snap_q)).scalars().all()
+
+    embed = discord.Embed(title=f"📸 Snapshots — {t.name}", color=discord.Color.blurple())
+    if not snapshots:
+        embed.description = "No snapshots yet. Snapshots are auto-taken at key lifecycle events.\nUse `/override snapshot` to take one now."
+    else:
+        for snap in snapshots:
+            ts = f"<t:{int(snap.created_at.timestamp())}:f>" if snap.created_at else "unknown"
+            embed.add_field(
+                name=f"📸 `{snap.id[:8]}` — {snap.label or snap.trigger or 'snapshot'}",
+                value=f"Taken: {ts}  •  Trigger: `{snap.trigger}`",
+                inline=False,
+            )
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 async def _panel_status(interaction: discord.Interaction, t_id: str) -> None:

@@ -46,6 +46,27 @@ class TournamentLifecycleService:
                 f"Valid transitions: {[s.value for s in VALID_TRANSITIONS[tournament.status]]}"
             )
 
+        # Rule engine pre-condition check
+        try:
+            from app.services.rule_engine.engine import RuleEngine
+            engine = RuleEngine(tournament)
+            violations = engine.validate_transition(new_status)
+            if violations:
+                # Log violations as warnings but don't block staff-initiated transitions
+                # (only block automated transitions from system actors)
+                if actor_type == "system":
+                    raise ValueError(
+                        "Rule engine blocked transition:\n" + "\n".join(f"• {v}" for v in violations)
+                    )
+                else:
+                    logger.warning(
+                        "Rule engine warnings for %s → %s (override by staff %s): %s",
+                        tournament.status.value, new_status.value, actor_id,
+                        "; ".join(violations),
+                    )
+        except ImportError:
+            pass
+
         old_status = tournament.status
         updated = await self.repo.update_status(tournament_id, organization_id, new_status)
 

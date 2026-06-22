@@ -314,7 +314,7 @@ async def _create_match_channels(
 
 
 async def _auto_complete_tournament(session, tournament, organization_id: str) -> None:
-    """Transition tournament to COMPLETED status automatically and post final results."""
+    """Transition tournament to COMPLETED, take snapshot, post results, then schedule archive."""
     from app.database.models.tournament import TournamentStatus
     from app.services.tournament.lifecycle import TournamentLifecycleService
     from app.database.repositories.tournament import TournamentRepository
@@ -334,11 +334,115 @@ async def _auto_complete_tournament(session, tournament, organization_id: str) -
                 )
                 logger.info("Autonomous engine: tournament %s auto-completed", tournament.id[:8])
 
+                # Auto-snapshot on completion
+                try:
+                    from app.services.snapshot.snapshot_service import SnapshotService
+                    snap_svc = SnapshotService(session)
+                    await snap_svc.take_snapshot(
+                        tournament_id=tournament.id,
+                        organization_id=organization_id,
+                        trigger="tournament_completed",
+                        label="Final state at tournament completion",
+                    )
+                except Exception as snap_exc:
+                    logger.warning("Auto-snapshot on completion failed: %s", snap_exc)
+
         # Fire completion notification
         asyncio.create_task(_notify_tournament_completed(tournament.id, organization_id))
 
+        # Schedule auto-archive (lock channels, set ARCHIVED status after 10 minutes)
+        asyncio.create_task(_auto_archive_tournament(tournament.id, organization_id, delay_seconds=600))
+
     except Exception as exc:
         logger.error("Auto-complete failed for tournament %s: %s", tournament.id[:8], exc)
+
+
+async def _auto_archive_tournament(tournament_id: str, organization_id: str, delay_seconds: int = 600) -> None:
+    """After a delay, transition COMPLETED → ARCHIVED and lock Discord channels."""
+    await asyncio.sleep(delay_seconds)
+    try:
+        from app.database.session import AsyncSessionLocal
+        from app.database.models.tournament import Tournament, TournamentStatus
+        from app.database.repositories.tournament import TournamentRepository
+
+        async with AsyncSessionLocal() as session:
+            repo = TournamentRepository(session)
+            t = await repo.get_by_id(tournament_id, organization_id)
+            if not t or t.status != TournamentStatus.COMPLETED:
+                return
+
+            if not t.can_transition_to(TournamentStatus.ARCHIVED):
+                logger.debug("Cannot archive tournament %s from status %s", tournament_id[:8], t.status.value)
+                return
+
+            async with session.begin():
+                from app.services.tournament.lifecycle import TournamentLifecycleService
+                svc = TournamentLifecycleService(session)
+                await svc.transition_status(
+                    tournament_id=tournament_id,
+                    organization_id=organization_id,
+                    new_status=TournamentStatus.ARCHIVED,
+                    actor_id="autonomous_engine",
+                    actor_type="system",
+                )
+                logger.info("Autonomous engine: tournament %s auto-archived", tournament_id[:8])
+
+        # Lock Discord channels (make them read-only)
+        asyncio.create_task(_lock_tournament_channels(tournament_id, organization_id))
+
+    except Exception as exc:
+        logger.warning("Auto-archive failed for tournament %s: %s", tournament_id[:8], exc)
+
+
+async def _lock_tournament_channels(tournament_id: str, organization_id: str) -> None:
+    """Make all channels in the tournament category read-only after archiving."""
+    try:
+        from app.services.notification.discord_delivery import get_bot
+        from app.database.session import AsyncSessionLocal
+        from app.database.models.tournament import Tournament
+        from app.database.models.guild import Guild
+        from sqlalchemy import select
+
+        bot = get_bot()
+        if not bot:
+            return
+
+        async with AsyncSessionLocal() as session:
+            tournament = await session.get(Tournament, tournament_id)
+            if not tournament:
+                return
+            guild_q = select(Guild).where(
+                Guild.organization_id == organization_id,
+                Guild.deleted_at.is_(None),
+            ).limit(1)
+            guild_row = (await session.execute(guild_q)).scalar_one_or_none()
+            if not guild_row:
+                return
+
+            tc: dict = tournament.channel_config or {}
+            category_id = tc.get("tournament_category_id") or tc.get("category_id")
+            if not category_id:
+                return
+
+        discord_guild = bot.get_guild(int(guild_row.discord_guild_id))
+        if not discord_guild:
+            return
+
+        cat = discord_guild.get_channel(int(category_id))
+        if not cat or not hasattr(cat, "channels"):
+            return
+
+        overwrite = discord.PermissionOverwrite(send_messages=False, add_reactions=False)
+        for ch in cat.channels:
+            try:
+                await ch.set_permissions(discord_guild.default_role, overwrite=overwrite)
+            except Exception:
+                pass
+
+        logger.info("Locked %d channels in tournament %s category", len(cat.channels), tournament_id[:8])
+
+    except Exception as exc:
+        logger.warning("_lock_tournament_channels failed for %s: %s", tournament_id[:8], exc)
 
 
 async def _notify_tournament_completed(tournament_id: str, organization_id: str) -> None:
